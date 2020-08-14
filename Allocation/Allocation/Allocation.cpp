@@ -3,13 +3,17 @@
 
 // Prologue of the buffer
 typedef struct prol {
-	struct prol *next; // Pointer to the next free buffer. The buffer is allocated if NULL
+	struct prol *prev; // Pointer to the previous free buffer
+	                   // The buffer is the head if NULL
+	struct prol *next; // Pointer to the next free buffer
+	                   // The buffer is the tail if the pointer is circular
+	                   // The buffer is allocated if NULL
 	std::size_t  size; // Size of the buffer
 } prol_t;
 
 // Epilogue of the buffer
 typedef struct epil {
-	prol_t      *prologue; // Pointer to the prologue of the buffer
+	prol_t      *prol; // Pointer to the prologue of the buffer
 } epil_t;
 
 // Converts the universal pointer to a structure pointer using offset in bytes
@@ -17,25 +21,46 @@ template<typename T> inline T *strt(void *ptr, std::int64_t offset = 0) {
 	return reinterpret_cast<T*>(reinterpret_cast<std::uint8_t*>(ptr) + offset);
 }
 
+inline prol_t *to_prol(void *ptr, std::int64_t offset = 0) {
+	return reinterpret_cast<prol_t*>(reinterpret_cast<std::uint8_t*>(ptr) + offset);
+}
+
+inline epil_t *to_epil(void *ptr, std::int64_t offset = 0) {
+	return reinterpret_cast<epil_t*>(reinterpret_cast<std::uint8_t*>(ptr) + offset);
+}
+
+/* Initializes a buffer */
+inline void *init_buffer(void *ptr, void *prev = NULL, void *next = NULL, std::size_t size = 0, prol_t **out_prol = NULL, epil_t **out_epil = NULL) {
+	prol_t *prol = to_prol(ptr);
+	prol->prev = to_prol(prev);
+	prol->next = to_prol(next);
+	prol->size = size;
+
+	if (out_prol)
+		*out_prol = prol;
+
+	epil_t *epil = to_epil(prol + 1, size);
+	epil->prol = prol;
+
+	if (out_epil)
+		*out_epil = epil;
+
+	return epil + 1;
+}
+
 // Head of the free buffers list
 prol_t *head;
-
-// Tail of the free buffers list
-prol_t *tail;
 
 /* Creates the initial memory buffer */
 void mysetup(void *buf, std::size_t size)
 {
-	// Initialize the prologue of the initial buffer
-	auto prologue = strt<prol_t>(buf);
-	prologue->next = prologue;
-	prologue->size = size - sizeof(prol_t) - sizeof(epil_t);
+	// Current buffer pointer
+	void *ptr = buf;
 
-	// Initialize the epilogue of the initial buffer
-	strt<epil_t>(prologue + 1, prologue->size)->prologue = prologue;
-
-	// Initialize the free buffers list
-	head = tail = prologue;
+	// Initializing actual (middle) and border (left, right) buffers
+	ptr = init_buffer(ptr);
+	ptr = init_buffer(ptr, NULL, ptr, size - sizeof(prol_t) * 2 - sizeof(epil_t) * 2, &head);
+	ptr = init_buffer(ptr);
 }
 
 /* Allocates a memory buffer of "size" bytes */
@@ -51,13 +76,24 @@ void *myalloc(std::size_t size)
 	do {
 		if (curr->size >= size)
 			if (curr->size <= sizeof(epil_t) + sizeof(prol_t) + size) {
-				if (curr == head)
-					if (curr == tail)
-						head = tail = NULL;
-					else
+				if (curr->prev) {
+					if (curr == curr->next) {
+						curr->prev->next = curr->prev;
+					}
+					else {
+						curr->prev->next = curr->next;
+						curr->next->prev = curr->prev;
+					}
+				}
+				else {
+					if (curr == curr->next) {
+						head = NULL;
+					}
+					else {
 						head = curr->next;
-				else
-					prev->next = curr->next;
+						head->prev = NULL;
+					}
+				}
 
 				curr->next = NULL;
 
@@ -69,22 +105,18 @@ void *myalloc(std::size_t size)
 
 				// Initialize the epilogue of the current buffer
 				auto epilogue = strt<epil_t>(curr + 1, curr->size);
-				epilogue->prologue = curr;
+				epilogue->prol = curr;
 
-				// Initialize the prologue of the allocated buffer
-				auto prologue = strt<prol_t>(epilogue + 1);
-				prologue->next = NULL;
-				prologue->size = size;
-				
-				// Initialize the epilogue of the allocated buffer
-				strt<epil_t>(prologue + 1, size)->prologue = prologue;
+				// 
+				prol_t *prologue;
+				init_buffer(epilogue + 1, NULL, NULL, size, &prologue);
 
 				return prologue + 1;
 			}
 
 		prev = curr;
 		curr = curr->next;
-	} while (prev != tail);
+	} while (curr != prev);
 
 	return NULL;
 }
@@ -92,25 +124,43 @@ void *myalloc(std::size_t size)
 /* Releases the memory buffer located at "p" */
 void myfree(void *p)
 {
-	auto curr = strt<prol_t>(p, -static_cast<std::int64_t>(sizeof(prol_t)));
-	auto prev = strt<epil_t>(curr, -static_cast<std::int64_t>(sizeof(epil_t)))->prologue;
-	auto next = strt<prol_t>(curr + 1, curr->size);
+	prol_t
+		*curr,
+		*prev,
+		*next;
 
-	if (prev->next) {
-		prev->size += sizeof(epil_t) + sizeof(prol_t) + curr->size;
-		strt<epil_t>(prev + 1, prev->size)->prologue = prev;
-		curr = prev;
-	}
-
-	if (curr != tail && next->next) {
-		if (next == tail) {
+	curr = to_prol(p) - 1;
+	
+	next = to_prol(curr + 1, curr->size + sizeof(epil_t));
+	if (next->next) {
+		if (next == next->next) {
 			curr->next = curr;
-			tail = curr;
-		} else
+		}
+		else {
 			curr->next = next->next;
+		}
 
-		curr->size += sizeof(epil_t) + sizeof(prol_t) + next->size;
-		strt<epil_t>(curr + 1, curr->size)->prologue = curr;
+		if (next->prev) {
+			next->prev->next = curr;
+		}
+		else {
+			head = curr;
+		}
+
+		curr->prev = next->prev;
+		curr->size += sizeof(prol_t) + next->size + sizeof(epil_t);
+	}
+	else {
+		if (head) {
+			curr->prev = NULL;
+			curr->next = head;
+			head->prev = curr;
+			head = curr;
+		}
+		else {
+			head = curr;
+			head->next = curr;
+		}
 	}
 }
 
@@ -124,18 +174,20 @@ int main()
 
 	void *pointers[5000];
 
-	for (std::size_t j = 2; j-- > 0;) {
-		std::size_t last = 0;
+	for (std::size_t j = 3; j-- > 0;) {
+		std::size_t allocations = 0;
 
-		for (std::size_t i = 1; i < 5000; i++)
-			if (!(pointers[i] = myalloc(i))) {
-				last = i;
-				std::cout << i << std::endl;
-				break;
-			}
+		for (std::size_t i = 5000 - 1; i-- > 0;) {
+			pointers[i] = myalloc(i);
+			if (pointers[i])
+				++allocations;
+		}
 	
-		for (std::size_t i = 1; i < last; i++)
-			myfree(pointers[i]);
+		std::cout << allocations << std::endl;
+
+		for (std::size_t i = 5000 - 1; i-- > 0;)
+			if (pointers[i])
+				myfree(pointers[i]);
 	}
 
 	std::cin.get();
