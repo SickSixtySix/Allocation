@@ -1,193 +1,175 @@
 ﻿#include <iostream>
 #include <cstdint>
+#include <vector>
 
-// Prologue of the buffer
-typedef struct prol {
-	struct prol *prev; // Pointer to the previous free buffer
-	                   // The buffer is the head if NULL
-	struct prol *next; // Pointer to the next free buffer
-	                   // The buffer is the tail if the pointer is circular
-	                   // The buffer is allocated if NULL
-	std::size_t  size; // Size of the buffer
-} prol_t;
+#define MIN_BUF_SIZE 16
 
-// Epilogue of the buffer
-typedef struct epil {
-	prol_t      *prol; // Pointer to the prologue of the buffer
-} epil_t;
+typedef struct mcb {
+	struct mcb *prev;
+	struct mcb *next;
+	std::size_t size;
+	bool free;
+} mcb_t;
 
-// Converts the universal pointer to a structure pointer using offset in bytes
-template<typename T> inline T *strt(void *ptr, std::int64_t offset = 0) {
-	return reinterpret_cast<T*>(reinterpret_cast<std::uint8_t*>(ptr) + offset);
+mcb_t *hb;
+
+inline void remove(mcb_t *b) {
+	if (b->prev) {
+		b->prev->next = b->next;
+		if (b->next) {
+			b->next->prev = b->prev;
+		}
+	}
+	else {
+		hb = b->next;
+		if (b->next) {
+			b->next->prev = NULL;
+		}
+	}
+
+	b->free = false;
 }
 
-inline prol_t *to_prol(void *ptr, std::int64_t offset = 0) {
-	return reinterpret_cast<prol_t*>(reinterpret_cast<std::uint8_t*>(ptr) + offset);
+inline mcb_t* beginning(void *p, mcb_t *prev = NULL, mcb_t *next = NULL, std::size_t size = 0, bool free = false) {
+	auto b = reinterpret_cast<mcb_t*>(p);
+	b->prev = prev;
+	b->next = next;
+	b->size = size;
+	b->free = free;
+	return b;
 }
 
-inline epil_t *to_epil(void *ptr, std::int64_t offset = 0) {
-	return reinterpret_cast<epil_t*>(reinterpret_cast<std::uint8_t*>(ptr) + offset);
+inline mcb_t** ending(mcb_t *b) {
+	auto e = reinterpret_cast<mcb_t**>(
+		reinterpret_cast<std::uint8_t*>(
+			b + 1
+			) + b->size
+		);
+	*e = b;
+	return e;
 }
 
-/* Initializes a buffer */
-inline void *init_buffer(void *ptr, void *prev = NULL, void *next = NULL, std::size_t size = 0, prol_t **out_prol = NULL, epil_t **out_epil = NULL) {
-	prol_t *prol = to_prol(ptr);
-	prol->prev = to_prol(prev);
-	prol->next = to_prol(next);
-	prol->size = size;
+inline void merge(mcb_t *pb, mcb_t *nb) {
+	// Update the beginning block of the merged buffer
+	pb->size += sizeof(mcb_t*) + sizeof(mcb_t) + nb->size;
 
-	if (out_prol)
-		*out_prol = prol;
-
-	epil_t *epil = to_epil(prol + 1, size);
-	epil->prol = prol;
-
-	if (out_epil)
-		*out_epil = epil;
-
-	return epil + 1;
+	// Update the ending block of the merged buffer
+	ending(pb);
 }
 
-// Head of the free buffers list
-prol_t *head;
-
-/* Creates the initial memory buffer */
 void mysetup(void *buf, std::size_t size)
 {
-	// Current buffer pointer
-	void *ptr = buf;
+	// Left heap border
+	auto lb = beginning(buf);
+	auto le = ending(lb);
 
-	// Initializing actual (middle) and border (left, right) buffers
-	ptr = init_buffer(ptr);
-	ptr = init_buffer(ptr, NULL, ptr, size - sizeof(prol_t) * 2 - sizeof(epil_t) * 2, &head);
-	ptr = init_buffer(ptr);
+	// Usable heap region
+	hb = beginning(le + 1, NULL, NULL,
+		size - sizeof(mcb_t) * 3 - sizeof(mcb_t*) * 3, true);
+	auto he = ending(hb);
+
+	// Right heap border
+	auto rb = beginning(he + 1);
+	auto re = ending(rb);
 }
 
-/* Allocates a memory buffer of "size" bytes */
 void *myalloc(std::size_t size)
 {
-	if (!size || !head)
-		return NULL;
+	auto cb = hb;
 
-	prol_t
-		*prev = NULL,
-		*curr = head;
-
-	do {
-		if (curr->size >= size)
-			if (curr->size <= sizeof(epil_t) + sizeof(prol_t) + size) {
-				if (curr->prev) {
-					if (curr == curr->next) {
-						curr->prev->next = curr->prev;
-					}
-					else {
-						curr->prev->next = curr->next;
-						curr->next->prev = curr->prev;
-					}
-				}
-				else {
-					if (curr == curr->next) {
-						head = NULL;
-					}
-					else {
-						head = curr->next;
-						head->prev = NULL;
-					}
-				}
-
-				curr->next = NULL;
-
-				return curr + 1;
+	while (cb) {
+		if (cb->size >= size) {
+			if (cb->size <= MIN_BUF_SIZE + sizeof(mcb_t*) + sizeof(mcb_t) + size) {
+				remove(cb);
+				return cb + 1;
 			}
 			else {
-				// Decrease current buffer size
-				curr->size -= sizeof(epil_t) + sizeof(prol_t) + size;
+				cb->size -= sizeof(mcb_t*) + sizeof(mcb_t) + size;
+				auto ce = ending(cb);
 
-				// Initialize the epilogue of the current buffer
-				auto epilogue = strt<epil_t>(curr + 1, curr->size);
-				epilogue->prol = curr;
-
-				// 
-				prol_t *prologue;
-				init_buffer(epilogue + 1, NULL, NULL, size, &prologue);
-
-				return prologue + 1;
+				auto nb = beginning(ce + 1, NULL, NULL, size);
+				ending(nb);
+				return nb + 1;
 			}
+		}
 
-		prev = curr;
-		curr = curr->next;
-	} while (curr != prev);
+		cb = cb->next;
+	}
 
 	return NULL;
 }
 
-/* Releases the memory buffer located at "p" */
 void myfree(void *p)
 {
-	prol_t
-		*curr,
-		*prev,
-		*next;
+	auto cb = reinterpret_cast<mcb_t*>(p) - 1;
+	auto pb = (*(reinterpret_cast<mcb_t**>(cb) - 1));
+	auto nb = reinterpret_cast<mcb_t*>(
+		reinterpret_cast<std::uint8_t*>(
+			cb + 1
+			) + cb->size + sizeof(mcb_t*)
+		);
 
-	curr = to_prol(p) - 1;
-	
-	next = to_prol(curr + 1, curr->size + sizeof(epil_t));
-	if (next->next) {
-		if (next == next->next) {
-			curr->next = curr;
-		}
-		else {
-			curr->next = next->next;
-		}
+	if (pb->free) {
+		// Remove the previous buffer from the free buffers list
+		remove(pb);
 
-		if (next->prev) {
-			next->prev->next = curr;
-		}
-		else {
-			head = curr;
-		}
+		// Merge the previous and the current buffers
+		merge(pb, cb);
 
-		curr->prev = next->prev;
-		curr->size += sizeof(prol_t) + next->size + sizeof(epil_t);
+		// Repeat operation on a new buffer
+		myfree(pb + 1);
+	}
+	else if (nb->free) {
+		// Remove the next buffer from the free buffers list
+		remove(nb);
+
+		// Merge the current and the next buffers
+		merge(cb, nb);
+
+		// Repeat operation on a new buffer
+		myfree(cb + 1);
 	}
 	else {
-		if (head) {
-			curr->prev = NULL;
-			curr->next = head;
-			head->prev = curr;
-			head = curr;
+		cb->prev = NULL;
+		cb->next = hb;
+		cb->free = true;
+
+		if (hb) {
+			hb->prev = cb;
 		}
-		else {
-			head = curr;
-			head->next = curr;
-		}
+
+		hb = cb;
 	}
 }
 
-/* 4 Mb size constant */
-#define SIZE 4 * 1024 * 1024
+#define HEAP_SIZE 524288
 
 int main()
 {
-	// Setup the allocator
-	mysetup(malloc(SIZE), SIZE);
+	srand(1);
 
-	void *pointers[5000];
+	mysetup(malloc(HEAP_SIZE), HEAP_SIZE);
 
-	for (std::size_t j = 3; j-- > 0;) {
-		std::size_t allocations = 0;
+	std::vector<void*> pointers;
+	std::size_t removals = 0;
 
-		for (std::size_t i = 5000 - 1; i-- > 0;) {
-			pointers[i] = myalloc(i);
-			if (pointers[i])
-				++allocations;
+	while (true) {
+		for (std::size_t i = rand() % 3 + 2; i-- > 0;) {
+			auto pointer = myalloc(16 + rand() % 2048);
+			if (pointer)
+				pointers.push_back(pointer);
 		}
-	
-		std::cout << allocations << std::endl;
 
-		for (std::size_t i = 5000 - 1; i-- > 0;)
-			if (pointers[i])
-				myfree(pointers[i]);
+		if (pointers.size() > 0) {
+			const auto id = rand() % pointers.size();
+			auto pointer = pointers[id];
+			pointers.erase(pointers.begin() + id);
+			myfree(pointer);
+
+			std::cout << "removed " << removals << std::endl;
+
+			removals++;
+		}
 	}
 
 	std::cin.get();
